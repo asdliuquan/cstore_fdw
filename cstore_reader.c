@@ -66,7 +66,6 @@ static void UpdateConstraint(Node *baseConstraint, Datum minValue, Datum maxValu
 static StripeSkipList * SelectedBlockSkipList(StripeSkipList *stripeSkipList,
 											  bool *selectedBlockMask);
 static uint32 StripeSkipListRowCount(StripeSkipList *stripeSkipList);
-static bool * ProjectedColumnMask(uint32 columnCount, List *projectedColumnList);
 static void DeserializeBoolArray(StringInfo boolArrayBuffer, bool *boolArray,
 								 uint32 boolArrayLength);
 static void DeserializeDatumArray(StringInfo datumBuffer, bool *existsArray,
@@ -939,7 +938,7 @@ StripeSkipListRowCount(StripeSkipList *stripeSkipList)
  * ProjectedColumnMask returns a boolean array in which the projected columns
  * from the projected column list are marked as true.
  */
-static bool *
+bool *
 ProjectedColumnMask(uint32 columnCount, List *projectedColumnList)
 {
 	bool *projectedColumnMask = palloc0(columnCount * sizeof(bool));

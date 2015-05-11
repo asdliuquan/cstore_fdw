@@ -326,6 +326,7 @@ extern bool CStoreReadFinished(TableReadState *state);
 extern bool CStoreReadNextRow(TableReadState *state, Datum *columnValues,
 							  bool *columnNulls);
 extern void CStoreEndRead(TableReadState *state);
+extern bool * ProjectedColumnMask(uint32 columnCount, List *projectedColumnList);
 
 /* Function declarations for common functions */
 extern FmgrInfo * GetFunctionInfoOrNull(Oid typeId, Oid accessMethodId,

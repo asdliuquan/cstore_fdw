@@ -47,6 +47,7 @@
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 
 
 /* local functions forward declarations */
@@ -83,6 +84,9 @@ static void CStoreGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel,
 									Oid foreignTableId);
 static void CStoreGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel,
 								  Oid foreignTableId);
+static double QueryPageCountEstimate(RelOptInfo *baserel, Oid foreignTableId);
+static double RandomPageEstimate(RelOptInfo *baserel, Oid foreignTableId);
+static double AttributeNullFraction(Oid relationId, AttrNumber attributeNumber);
 static ForeignScan * CStoreGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel,
 										  Oid foreignTableId, ForeignPath *bestPath,
 										  List *targetList, List *scanClauses);
@@ -1091,39 +1095,17 @@ CStoreGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId
 {
 	Path *foreignScanPath = NULL;
 	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
-	Relation relation = heap_open(foreignTableId, AccessShareLock);
 
-	/*
-	 * We skip reading columns that are not in query. Here we assume that all
-	 * columns in relation have the same width, and estimate the number pages
-	 * that will be read by query.
-	 *
-	 * Ideally, we should also take into account the row blocks that will be
-	 * suppressed. But for that we need to know which columns are used for
-	 * sorting. If we wrongly assume that we are sorted by a specific column
-	 * and underestimate the page count, planner may choose nested loop join
-	 * in a place it shouldn't be used. Choosing merge join or hash join is
-	 * usually safer than nested loop join, so we take the more conservative
-	 * approach and assume all rows in the columnar store file will be read.
-	 * We intend to fix this in later version by improving the row sampling
-	 * algorithm and using the correlation statistics to detect which columns
-	 * are in stored in sorted order.
-	 */
-	List *queryColumnList = ColumnList(baserel);
-	uint32 queryColumnCount = list_length(queryColumnList);
-	BlockNumber relationPageCount = PageCount(cstoreFdwOptions->filename);
-	uint32 relationColumnCount = RelationGetNumberOfAttributes(relation);
-
-	double queryColumnRatio = (double) queryColumnCount / relationColumnCount;
-	double queryPageCount = relationPageCount * queryColumnRatio;
-	double totalDiskAccessCost = seq_page_cost * queryPageCount;
-
-	double tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->filename);
+	double queryPageCountEstimate = QueryPageCountEstimate(baserel, foreignTableId);
+	double randomAccessEstimate = RandomPageEstimate(baserel, foreignTableId);
+	double totalDiskAccessCost = seq_page_cost * queryPageCountEstimate +
+								 random_page_cost * randomAccessEstimate;
 
 	/*
 	 * We estimate costs almost the same way as cost_seqscan(), thus assuming
 	 * that I/O costs are equivalent to a regular table file of the same size.
 	 */
+	double tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->filename);
 	double filterCostPerTuple = baserel->baserestrictcost.per_tuple;
 	double cpuCostPerTuple = cpu_tuple_cost + filterCostPerTuple;
 	double totalCpuCost = cpuCostPerTuple * tupleCountEstimate;
@@ -1139,7 +1121,138 @@ CStoreGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId
 													   NIL); /* no fdw_private */
 
 	add_path(baserel, foreignScanPath);
-	heap_close(relation, AccessShareLock);
+}
+
+
+/*
+ * QueryPageCountEstimate returns estimated number of pages of the given cstore
+ * table that a query with given baserel will read.
+ */
+static double
+QueryPageCountEstimate(RelOptInfo *baserel, Oid foreignTableId)
+{
+	double queryPageCountEstimate = 0.0;
+	double queryColumnRatio = 0.0;
+	double relationColumnWidth = 0;
+	double queryColumnWidth = 0;
+	int32 columnIndex = 0;
+	BlockNumber relationPageCount = 0;
+	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
+
+	AttrNumber columnCount = baserel->max_attr;
+	List *queryColumnList = ColumnList(baserel);
+	bool *projectedColumnMask = ProjectedColumnMask(columnCount, queryColumnList);
+
+	/* calculate relation column width and query column width */
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		AttrNumber columnAttributeNumber = columnIndex + 1;
+		double nullFraction = AttributeNullFraction(foreignTableId,
+													columnAttributeNumber);
+
+		int32 columnWidth = get_attavgwidth(foreignTableId, columnAttributeNumber);
+		if (columnWidth == 0)
+		{
+			/* if not analyzed yet, assume all columns have same width */
+			relationColumnWidth++;
+
+			if (projectedColumnMask[columnIndex])
+			{
+				queryColumnWidth++;
+			}
+		}
+		else
+		{
+			/*
+			 * We don't store any values for NULL values, and get_attavgwidth()
+			 * doesn't take into account NULL values.
+			 */
+			relationColumnWidth += columnWidth * (1.0 - nullFraction);
+
+			if (projectedColumnMask[columnIndex])
+			{
+				queryColumnWidth += columnWidth * (1.0 - nullFraction);
+			}
+		}
+	}
+
+	/*
+	 * We skip reading columns that are not in query.
+	 *
+	 * Ideally, we should also take into account the row blocks that will be
+	 * suppressed. But for that we need to know which columns are used for
+	 * sorting. If we wrongly assume that we are sorted by a specific column
+	 * and underestimate the page count, planner may choose nested loop join
+	 * in a place it shouldn't be used. Choosing merge join or hash join is
+	 * usually safer than nested loop join, so we take the more conservative
+	 * approach and assume all rows in the columnar store file will be read.
+	 * We intend to fix this in later version by improving the row sampling
+	 * algorithm and using the correlation statistics to detect which columns
+	 * are in stored in sorted order.
+	 */
+	relationPageCount = PageCount(cstoreFdwOptions->filename);
+	queryColumnRatio = queryColumnWidth / relationColumnWidth;
+	queryPageCountEstimate = relationPageCount * queryColumnRatio;
+
+	return queryPageCountEstimate;
+}
+
+
+/*
+ * RandomPageEstimate estimates the number of random page accesses we need to do
+ * when reading a cstore file.
+ */
+static double
+RandomPageEstimate(RelOptInfo *baserel, Oid foreignTableId)
+{
+	double randomPageEstimate = 0.0;
+	double tupleCountEstimate = 0.0;
+	double stripeCountEstimate = 0.0;
+	
+	AttrNumber columnCount = baserel->max_attr;
+	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
+
+	tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->filename);
+	stripeCountEstimate = tupleCountEstimate / cstoreFdwOptions->stripeRowCount + 1;
+
+	/*
+	 * The first step when reading a stripe is to read its footer, then we need
+	 * to move the header back to read the stripe skip list. This adds two random
+	 * page accesses per stripe.
+	 */
+	randomPageEstimate += 2.0 * stripeCountEstimate;
+
+	/*
+	 * When we finish reading a column, we move to the beginning of next column.
+	 * Since we skip unused columns, this is a random access in most cases.
+	 */
+	randomPageEstimate += stripeCountEstimate * (double) columnCount;
+
+	return randomPageEstimate;
+}
+
+
+/*
+ * AttributeNullFraction returns the fraction of items for the given attribute
+ * that are NULL. This is extracted from statistics gathered from last ANALYZE.
+ * If relation is never analyzed, this function returns 0.
+ */
+static double
+AttributeNullFraction(Oid relationId, AttrNumber attributeNumber)
+{
+	double nullFraction = 0.0;
+
+	HeapTuple heapTuple = SearchSysCache3(STATRELATTINH,
+										 ObjectIdGetDatum(relationId),
+										 Int16GetDatum(attributeNumber),
+										 BoolGetDatum(false));
+	if (HeapTupleIsValid(heapTuple))
+	{
+		nullFraction = ((Form_pg_statistic) GETSTRUCT(heapTuple))->stanullfrac;
+		ReleaseSysCache(heapTuple);
+	}
+
+	return nullFraction;
 }
 
 
